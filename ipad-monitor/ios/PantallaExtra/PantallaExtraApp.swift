@@ -19,6 +19,8 @@ final class Session: ObservableObject {
     @Published var active = false
     @Published var connected = false
     @Published var status = ""
+    @Published var monitors: [StreamClient.Monitor] = []
+    @Published var currentMonitor = 0
 
     let client = StreamClient()
     let screen = ScreenView(frame: .zero)
@@ -29,8 +31,12 @@ final class Session: ObservableObject {
         client.onFrame = { [weak self] data in
             DispatchQueue.main.async { self?.screen.enqueue(data) }
         }
-        client.onHello = { [weak self] size, _ in
-            DispatchQueue.main.async { self?.screen.remoteSize = size }
+        client.onHello = { [weak self] size, _, monitors, current in
+            DispatchQueue.main.async {
+                self?.screen.remoteSize = size
+                self?.monitors = monitors
+                self?.currentMonitor = current
+            }
         }
         client.onState = { [weak self] state in
             DispatchQueue.main.async { self?.apply(state) }
@@ -45,8 +51,14 @@ final class Session: ObservableObject {
         client.start(mode)
     }
 
+    func selectMonitor(_ index: Int) {
+        currentMonitor = index
+        client.send(["t": "monitor", "i": index])
+    }
+
     func stop() {
         client.stop()
+        monitors = []
         screen.resignFirstResponder()
         active = false
         connected = false
@@ -192,9 +204,31 @@ struct DisplayView: View {
             }
             .padding(14)
             .opacity(0.6)
+
+            if showControls && session.monitors.count > 1 {
+                monitorBar
+                    .padding(.top, 14)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            }
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+    }
+
+    private var monitorBar: some View {
+        HStack(spacing: 8) {
+            ForEach(session.monitors) { monitor in
+                Button { session.selectMonitor(monitor.index) } label: {
+                    Text(monitor.label)
+                        .font(.system(size: 15, weight: .semibold))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                        .background(monitor.index == session.currentMonitor
+                                    ? Color.accentColor : Color.black.opacity(0.7), in: Capsule())
+                        .foregroundStyle(.white)
+                }
+            }
+        }
     }
 
     private func controlButton(_ icon: String, action: @escaping () -> Void) -> some View {

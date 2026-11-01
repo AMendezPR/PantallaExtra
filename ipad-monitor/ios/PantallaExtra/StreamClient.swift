@@ -11,6 +11,12 @@ import Network
 /// Protocolo: [tipo:1][largo:4 big-endian][datos]
 ///   1 HELLO (JSON), 2 FRAME (JPEG), 3 INPUT (JSON, del iPad al computador)
 final class StreamClient {
+    struct Monitor: Identifiable, Equatable {
+        let index: Int
+        let label: String
+        var id: Int { index }
+    }
+
     enum Mode: Equatable {
         case wifi(host: String, port: UInt16)
         case usb(port: UInt16)
@@ -23,7 +29,7 @@ final class StreamClient {
     }
 
     var onState: ((State) -> Void)?
-    var onHello: ((CGSize, String?) -> Void)?
+    var onHello: ((CGSize, String?, [Monitor], Int) -> Void)?
     var onFrame: ((Data) -> Void)?
 
     private let queue = DispatchQueue(label: "pantallaextra.net", qos: .userInteractive)
@@ -192,7 +198,14 @@ final class StreamClient {
             let w = (obj["width"] as? NSNumber)?.doubleValue ?? 0
             let h = (obj["height"] as? NSNumber)?.doubleValue ?? 0
             let name = obj["name"] as? String
-            onHello?(CGSize(width: w, height: h), name)
+            let list = (obj["monitors"] as? [[String: Any]]) ?? []
+            let monitors = list.compactMap { m -> Monitor? in
+                guard let index = (m["index"] as? NSNumber)?.intValue,
+                      let label = m["label"] as? String else { return nil }
+                return Monitor(index: index, label: label)
+            }
+            let current = (obj["current"] as? NSNumber)?.intValue ?? 0
+            onHello?(CGSize(width: w, height: h), name, monitors, current)
             report(.connected(name: name))
         default:
             break

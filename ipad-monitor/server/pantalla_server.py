@@ -26,6 +26,7 @@ import io
 import json
 import logging
 import os
+import re
 import socket
 import struct
 import sys
@@ -34,7 +35,7 @@ import time
 import zlib
 
 import mss
-from PIL import Image
+from PIL import Image, ImageDraw
 
 MSG_HELLO, MSG_FRAME, MSG_INPUT = 1, 2, 3
 HEADER = struct.Struct(">BI")
@@ -42,6 +43,41 @@ MAX_INPUT_MSG = 64 * 1024
 _MSS = getattr(mss, "MSS", None) or mss.mss  # mss>=10 renombro la clase
 
 log = logging.getLogger("pantalla")
+
+# Flecha del cursor (mss no lo captura, asi que lo dibujamos en cada frame)
+CURSOR_SHAPE = ((0, 0), (0, 17), (4, 13), (7, 20), (10, 19), (7, 12), (12, 12))
+CURSOR_SCALE = 1.5
+# Nombre del monitor virtual que se envia al iPad
+VIRTUAL_MONITOR = re.compile(r"vdd|virtual display|mtt", re.I)
+
+
+def cursor_reader():
+    """Devuelve una funcion que da el cursor relativo a un monitor, o None si esta fuera."""
+    try:
+        from pynput import mouse
+        controller = mouse.Controller()
+    except Exception as exc:  # p.ej. Linux sin X
+        log.warning("No se puede leer el cursor (%s). No se dibujara.", exc)
+        return lambda mon: None
+
+    def read(mon: dict):
+        x, y = controller.position
+        x, y = x - mon["left"], y - mon["top"]
+        return (x, y) if 0 <= x < mon["width"] and 0 <= y < mon["height"] else None
+    return read
+
+
+def draw_cursor(img: Image.Image, x: int, y: int) -> None:
+    points = [(x + px * CURSOR_SCALE, y + py * CURSOR_SCALE) for px, py in CURSOR_SHAPE]
+    ImageDraw.Draw(img).polygon(points, fill="white", outline="black", width=2)
+
+
+def is_virtual(mon: dict) -> bool:
+    return bool(VIRTUAL_MONITOR.search(str(mon.get("name", ""))))
+
+
+def monitor_label(index: int, mon: dict) -> str:
+    return f"Monitor {index} iPad" if is_virtual(mon) else f"Monitor {index}"
 
 
 # --------------------------------------------------------------------------
@@ -62,27 +98,31 @@ class Capturer(threading.Thread):
 
     def run(self) -> None:
         with _MSS() as sct:
-            mon = sct.monitors[self.monitor_index]
-            last_crc = None
+            read_cursor = cursor_reader()
+            last_crc = last_cursor = None
             last_sent = 0.0
             while not self.stopped.is_set():
                 if not self.active.wait(timeout=0.5):
                     continue
                 t0 = time.perf_counter()
+                mon = sct.monitors[self.monitor_index]
                 shot = sct.grab(mon)
                 crc = zlib.crc32(shot.raw)
                 now = time.monotonic()
-                changed = crc != last_crc
+                cursor = read_cursor(mon)
+                changed = crc != last_crc or cursor != last_cursor
                 if changed or self.force.is_set() or now - last_sent > 2.0:
                     self.force.clear()
                     img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                    if cursor:
+                        draw_cursor(img, *cursor)
                     if self.max_width and img.width > self.max_width:
                         h = round(img.height * self.max_width / img.width)
                         img = img.resize((self.max_width, h), Image.BILINEAR)
                     buf = io.BytesIO()
                     img.save(buf, "JPEG", quality=self.quality)
                     self.publish(buf.getvalue())
-                    last_crc, last_sent = crc, now
+                    last_crc, last_cursor, last_sent = crc, cursor, now
                 # Si la pantalla no cambia, revisamos con menos frecuencia.
                 wait = self.interval if changed else max(self.interval, 1 / 20)
                 time.sleep(max(0.0, wait - (time.perf_counter() - t0)))
@@ -92,8 +132,14 @@ class Capturer(threading.Thread):
 # Distribucion del ultimo frame a todos los clientes
 # --------------------------------------------------------------------------
 class FrameHub:
-    def __init__(self, loop: asyncio.AbstractEventLoop, capturer_factory):
+    def __init__(self, loop: asyncio.AbstractEventLoop, capturer_factory,
+                 monitors: list[dict], current: int, name: str, on_select):
         self.loop = loop
+        self.monitors = monitors
+        self.current = current
+        self.name = name
+        self.on_select = on_select        # callable(dict) al cambiar de monitor
+        self.hello_seq = 0
         self.frame: bytes | None = None
         self.seq = 0
         self.cond = asyncio.Condition()
@@ -110,6 +156,27 @@ class FrameHub:
             self.seq += 1
             self.cond.notify_all()
 
+    def hello(self) -> dict:
+        mon = self.monitors[self.current]
+        return {"width": mon["width"], "height": mon["height"], "name": self.name,
+                "current": self.current,
+                "monitors": [{"index": i, "label": monitor_label(i, m)}
+                             for i, m in enumerate(self.monitors) if i > 0]}
+
+    async def select(self, index: int) -> None:
+        """Cambia el monitor enviado y avisa a todos los clientes."""
+        if index == self.current or not 1 <= index < len(self.monitors):
+            return
+        async with self.cond:
+            self.current = index
+            self.on_select(self.monitors[index])
+            self.capturer.monitor_index = index
+            self.capturer.force.set()
+            self.frame = None
+            self.hello_seq += 1
+            self.cond.notify_all()
+        log.info("Enviando monitor %d", index)
+
     def add_client(self) -> None:
         self.clients += 1
         self.capturer.force.set()
@@ -121,14 +188,22 @@ class FrameHub:
             self.clients = 0
             self.capturer.active.clear()
 
-    async def stream(self, send) -> None:
-        """Envia siempre el frame mas reciente; un cliente lento se salta frames."""
-        seen = -1
+    async def stream(self, send, send_hello) -> None:
+        """Envia el HELLO si cambio y siempre el frame mas reciente; un cliente lento se salta frames."""
+        seen = seen_hello = -1
         while True:
             async with self.cond:
-                await self.cond.wait_for(lambda: self.seq != seen and self.frame)
-                seen, data = self.seq, self.frame
-            await send(data)
+                await self.cond.wait_for(
+                    lambda: self.hello_seq != seen_hello or (self.seq != seen and self.frame))
+                hello = data = None
+                if self.hello_seq != seen_hello:
+                    seen_hello, hello = self.hello_seq, self.hello()
+                else:
+                    seen, data = self.seq, self.frame
+            if hello is not None:
+                await send_hello(hello)
+            else:
+                await send(data)
 
 
 # --------------------------------------------------------------------------
@@ -195,10 +270,17 @@ class InputHandler:
             log.warning("Evento %r fallo: %s", t, exc)
 
 
+async def handle_event(ev: dict, hub: FrameHub, inp: InputHandler) -> None:
+    if ev.get("t") == "monitor":
+        await hub.select(int(ev.get("i", 0)))
+    else:
+        inp.handle(ev)
+
+
 # --------------------------------------------------------------------------
 # Sesion sobre TCP (app nativa: Wi-Fi o USB)
 # --------------------------------------------------------------------------
-async def tcp_session(reader, writer, hub: FrameHub, inp: InputHandler, hello: dict, label: str):
+async def tcp_session(reader, writer, hub: FrameHub, inp: InputHandler, label: str):
     sock = writer.get_extra_info("socket")
     if sock is not None:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -214,15 +296,16 @@ async def tcp_session(reader, writer, hub: FrameHub, inp: InputHandler, hello: d
                 raise ValueError("mensaje demasiado grande")
             data = await reader.readexactly(length)
             if kind == MSG_INPUT:
-                inp.handle(json.loads(data))
+                await handle_event(json.loads(data), hub, inp)
 
     log.info("iPad conectado (%s)", label)
     hub.add_client()
     tasks = []
     try:
-        await send(MSG_HELLO, json.dumps(hello).encode())
         tasks = [asyncio.ensure_future(receive()),
-                 asyncio.ensure_future(hub.stream(lambda d: send(MSG_FRAME, d)))]
+                 asyncio.ensure_future(hub.stream(
+                     lambda d: send(MSG_FRAME, d),
+                     lambda h: send(MSG_HELLO, json.dumps(h).encode())))]
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for t in done:
             if t.exception() and not isinstance(t.exception(), (asyncio.IncompleteReadError, ConnectionError)):
@@ -237,13 +320,13 @@ async def tcp_session(reader, writer, hub: FrameHub, inp: InputHandler, hello: d
         log.info("iPad desconectado (%s)", label)
 
 
-async def usb_loop(port: int, hub, inp, hello) -> None:
+async def usb_loop(port: int, hub, inp) -> None:
     """Modo USB: el iPad escucha; nos conectamos a traves del reenviador local."""
     log.info("Modo USB: buscando el iPad en 127.0.0.1:%d (reenviador USB)...", port)
     while True:
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", port)
-            await tcp_session(reader, writer, hub, inp, hello, "USB")
+            await tcp_session(reader, writer, hub, inp, "USB")
         except (ConnectionError, OSError):
             pass
         await asyncio.sleep(1.5)
@@ -252,7 +335,7 @@ async def usb_loop(port: int, hub, inp, hello) -> None:
 # --------------------------------------------------------------------------
 # Cliente web (Safari) sobre WebSocket
 # --------------------------------------------------------------------------
-def make_web_app(hub: FrameHub, inp: InputHandler, hello: dict):
+def make_web_app(hub: FrameHub, inp: InputHandler):
     from aiohttp import WSMsgType, web
 
     web_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
@@ -265,12 +348,12 @@ def make_web_app(hub: FrameHub, inp: InputHandler, hello: dict):
         await ws.prepare(request)
         log.info("Navegador conectado (%s)", request.remote)
         hub.add_client()
-        await ws.send_str(json.dumps(hello))
-        sender = asyncio.ensure_future(hub.stream(ws.send_bytes))
+        sender = asyncio.ensure_future(hub.stream(
+            ws.send_bytes, lambda h: ws.send_str(json.dumps(h))))
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
-                    inp.handle(json.loads(msg.data))
+                    await handle_event(json.loads(msg.data), hub, inp)
         except Exception as exc:
             log.warning("WebSocket: %s", exc)
         finally:
@@ -306,33 +389,35 @@ def local_ips() -> list[str]:
 def list_monitors() -> None:
     with _MSS() as sct:
         for i, m in enumerate(sct.monitors):
-            tag = "todos los monitores juntos" if i == 0 else ""
+            tag = "todos los monitores juntos" if i == 0 else monitor_label(i, m)
             print(f"  {i}: {m['width']}x{m['height']} en ({m['left']},{m['top']}) {tag}")
 
 
 async def main_async(args) -> None:
     with _MSS() as sct:
-        if not 0 <= args.monitor < len(sct.monitors):
-            sys.exit(f"Monitor {args.monitor} no existe. Usa --listar.")
-        monitor = dict(sct.monitors[args.monitor])
+        monitors = [dict(m) for m in sct.monitors]
+    if args.monitor is None:
+        args.monitor = next((i for i, m in enumerate(monitors) if i and is_virtual(m)), 1)
+    if not 0 <= args.monitor < len(monitors):
+        sys.exit(f"Monitor {args.monitor} no existe. Usa --listar.")
+    monitor = monitors[args.monitor]
 
     loop = asyncio.get_running_loop()
-    hub = FrameHub(loop, lambda publish: Capturer(
-        args.monitor, args.fps, args.calidad, args.ancho_max, publish))
     inp = InputHandler(monitor, enabled=not args.solo_ver)
-    hello = {"width": monitor["width"], "height": monitor["height"],
-             "name": socket.gethostname()}
+    hub = FrameHub(loop, lambda publish: Capturer(
+        args.monitor, args.fps, args.calidad, args.ancho_max, publish),
+        monitors, args.monitor, socket.gethostname(), lambda mon: setattr(inp, "mon", mon))
 
     servers = []
     tcp = await asyncio.start_server(
-        lambda r, w: tcp_session(r, w, hub, inp, hello, w.get_extra_info("peername")[0]),
+        lambda r, w: tcp_session(r, w, hub, inp, w.get_extra_info("peername")[0]),
         host=args.host, port=args.puerto)
     servers.append(tcp)
 
     web_runner = None
     if not args.sin_web:
         from aiohttp import web
-        web_runner = web.AppRunner(make_web_app(hub, inp, hello), access_log=None)
+        web_runner = web.AppRunner(make_web_app(hub, inp), access_log=None)
         await web_runner.setup()
         await web.TCPSite(web_runner, args.host, args.puerto_web).start()
 
@@ -346,7 +431,7 @@ async def main_async(args) -> None:
 
     tasks = [asyncio.ensure_future(tcp.serve_forever())]
     if args.usb:
-        tasks.append(asyncio.ensure_future(usb_loop(args.puerto_usb, hub, inp, hello)))
+        tasks.append(asyncio.ensure_future(usb_loop(args.puerto_usb, hub, inp)))
     try:
         await asyncio.gather(*tasks)
     finally:
@@ -358,8 +443,8 @@ async def main_async(args) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description="Usa tu iPad como segundo monitor tactil.")
     p.add_argument("--listar", action="store_true", help="muestra los monitores y sale")
-    p.add_argument("--monitor", type=int, default=1,
-                   help="numero de monitor a enviar (1 = principal; usa --listar)")
+    p.add_argument("--monitor", type=int, default=None,
+                   help="monitor inicial (def. el virtual si existe, si no el 1; usa --listar)")
     p.add_argument("--fps", type=float, default=30, help="cuadros por segundo (def. 30)")
     p.add_argument("--calidad", type=int, default=70, help="calidad JPEG 1-95 (def. 70)")
     p.add_argument("--ancho-max", type=int, default=2048,

@@ -49,6 +49,8 @@ Para que el iPad sea **una pantalla extra** (extender el escritorio), crea un mo
 - **Mac:** las Mac ya traen **Sidecar** (Centro de control → Duplicar pantalla → tu iPad), que hace esto de forma nativa. Si prefieres usar PantallaExtra, crea una pantalla virtual con una app como *BetterDisplay* y envíala con `--monitor N`.
 - **Linux (X11):** agrega una salida virtual con `xrandr` y envíala con `--monitor N`.
 
+En la app, los botones de arriba (**Monitor 1**, **Monitor 2**, **Monitor 3 iPad**) cambian el monitor que se ve. El monitor virtual aparece como “iPad” y se elige solo al arrancar; se esconden con la flecha de abajo.
+
 Opciones útiles: `--fps 30`, `--calidad 70` (de 1 a 95), `--ancho-max 2048`, `--solo-ver` (sin control táctil) y `--sin-web`.
 
 ---
@@ -123,6 +125,6 @@ Por cable la imagen es más estable y no depende del Wi-Fi.
 ## Limitaciones
 
 - La imagen viaja como JPEG: hay algo de retraso (de 50 a 150 ms en una buena red Wi-Fi). Sirve para documentos, navegador, paletas de herramientas o una agenda; no para juegos. Si va lento, baja `--fps` o `--calidad`.
-- No transmite audio y la imagen no muestra el puntero del mouse.
+- No transmite audio. El puntero del mouse se muestra siempre como una flecha, sin importar la forma que tenga en el computador.
 - Los toques se envían como mouse (un dedo a la vez), no como multitáctil nativo de Windows.
 - El servidor no tiene contraseña: úsalo solo en redes de confianza (tu casa u oficina).
