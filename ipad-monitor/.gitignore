@@ -1,0 +1,7 @@
+ios/*.xcodeproj/
+ios/build/
+ios/Payload/
+ios/*.ipa
+ios/PantallaExtra/Info.plist
+__pycache__/
+.venv/

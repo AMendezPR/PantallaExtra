@@ -1,0 +1,46 @@
+name: Compilar app PantallaExtra (iPad)
+
+on:
+  push:
+    paths:
+      - "ipad-monitor/ios/**"
+      - ".github/workflows/ipad-app.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: ipad-monitor/ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar XcodeGen
+        run: brew install xcodegen
+
+      - name: Generar proyecto Xcode
+        run: xcodegen generate
+
+      - name: Compilar (sin firmar)
+        run: |
+          xcodebuild \
+            -project PantallaExtra.xcodeproj \
+            -scheme PantallaExtra \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Empaquetar .ipa
+        run: |
+          rm -rf Payload && mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/PantallaExtra.app Payload/
+          zip -qry PantallaExtra.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PantallaExtra-ipa
+          path: ipad-monitor/ios/PantallaExtra.ipa

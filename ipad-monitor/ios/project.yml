@@ -1,0 +1,42 @@
+# Proyecto Xcode generado con XcodeGen:  brew install xcodegen && xcodegen generate
+name: PantallaExtra
+options:
+  bundleIdPrefix: com.pantallaextra
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  PantallaExtra:
+    type: application
+    platform: iOS
+    sources:
+      - path: PantallaExtra
+    scheme: {}
+    info:
+      path: PantallaExtra/Info.plist
+      properties:
+        CFBundleDisplayName: PantallaExtra
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UIStatusBarHidden: true
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        NSLocalNetworkUsageDescription: "PantallaExtra se conecta a tu computador en la red local para mostrar su pantalla y enviar tus toques."
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pantallaextra.app
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.0"
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_STYLE: Automatic
